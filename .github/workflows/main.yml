@@ -1,46 +1,146 @@
-name: HenWindows 2022 Full
-
-on: workflow_dispatch
+name: Windows RDP Tailscale
+on:
+  workflow_dispatch:
 
 jobs:
   build:
-    runs-on: windows-2022
-    timeout-minutes: 9999
-
+    runs-on: windows-latest
+    timeout-minutes: 385
     steps:
-    - name: Making the Core
+    - uses: actions/checkout@v4
+    - name: Setup Tailscale RDP
+      shell: pwsh
       run: |
-        Invoke-WebRequest https://raw.githubusercontent.com/arifkembiri/RDP-Windows-2022-Tailscale/refs/heads/main/start.bat -OutFile start.bat
-        Invoke-WebRequest https://github.com/arifkembiri/RDP-Windows-2022-Tailscale/blob/main/wallpaper.png?raw=true -OutFile wallpaper.png
-        Invoke-WebRequest https://raw.githubusercontent.com/arifkembiri/RDP-Windows-2022-Tailscale/refs/heads/main/wallpaper.bat -OutFile wallpaper.bat
-        Invoke-WebRequest https://raw.githubusercontent.com/arifkembiri/RDP-Windows-2022-Tailscale/refs/heads/main/loop.bat -OutFile loop.bat
-    - name: Install Tailscale
-      run: |
-        Invoke-WebRequest -Uri https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe -OutFile tailscale-setup.exe
-        Start-Process tailscale-setup.exe -ArgumentList "/quiet", "/norestart" -Wait
-    - name: Add Tailscale to PATH
-      run: |
-        [System.Environment]::SetEnvironmentVariable('PATH', $env:PATH + ";C:\Program Files\Tailscale", [System.EnvironmentVariableTarget]::Machine)
-    - name: Verify Tailscale installation with full path
-      run: |
-        & "C:\Program Files\Tailscale\tailscale.exe" version || echo "Tailscale is not installed"
-    - name: Authenticate Tailscale with full path
-      run: |
-        & "C:\Program Files\Tailscale\tailscale.exe" up --authkey $Env:TAILSCALE_AUTHKEY
-      env:
-        TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-    - name: Enable access to RDP
-      run: | 
-        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
-        Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 1
-        copy wallpaper.png C:\Users\Public\Desktop\wallpaper.png
-        copy wallpaper.bat C:\Users\Public\Desktop\wallpaper.bat
-    - name: Get Tailscale IP and RDP Access
-      run: |
-        $tailscale_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
-        echo "Tailscale IP: $tailscale_ip"
-    - name: Start RDP session
-      run: cmd /c start.bat
-    - name: Successfully made! You can close the tab now.
-      run: cmd /c loop.bat
+        $ErrorActionPreference = "Continue"
+        $pw = "VpsK2RDWfna"
+        $total = 360
+        $info = "info.txt"
+        
+        function Save($v) { $v | Out-File $info -Encoding UTF8 -NoNewline -Force }
+        
+        # Set password
+        $sec = ConvertTo-SecureString $pw -AsPlainText -Force
+        Set-LocalUser -Name "runneradmin" -Password $sec
+        
+        # Enable RDP
+        Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0 -Type DWord -Force
+        Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 1 -Type DWord -Force
+        
+        # Download Tailscale
+        Write-Host "Downloading Tailscale..."
+        $downloaded = $false
+        for ($i = 0; $i -lt 5; $i++) {
+          try {
+            Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile "ts.exe" -TimeoutSec 120
+            if ((Test-Path "ts.exe") -and (Get-Item "ts.exe").Length -gt 1000000) {
+              $downloaded = $true
+              break
+            }
+          } catch { Start-Sleep 5 }
+        }
+        
+        if (-not $downloaded) {
+          Save "ERROR|Failed to download Tailscale"
+          for ($m = 1; $m -le $total; $m++) { Start-Sleep 60 }
+          exit 0
+        }
+        
+        # Install Tailscale
+        Write-Host "Installing Tailscale..."
+        Start-Process "ts.exe" -ArgumentList "/quiet" -Wait
+        Start-Sleep 10
+        
+        $exe = "C:\Program Files\Tailscale\tailscale.exe"
+        if (-not (Test-Path $exe)) {
+          Save "ERROR|Tailscale not installed"
+          for ($m = 1; $m -le $total; $m++) { Start-Sleep 60 }
+          exit 0
+        }
+        
+        # Start Tailscale with separate log files
+        Write-Host "Starting Tailscale..."
+        Start-Process $exe -ArgumentList "up","--hostname=win-rdp-gh" -RedirectStandardOutput "ts_out.log" -RedirectStandardError "ts_err.log" -WindowStyle Hidden
+        Start-Sleep 5
+        
+        # Wait for auth URL - check both log files
+        $auth = ""
+        $start = Get-Date
+        while ((Get-Date) - $start -lt [TimeSpan]::FromSeconds(90)) {
+          # Check stdout log
+          if (Test-Path "ts_out.log") {
+            $c = Get-Content "ts_out.log" -Raw -ErrorAction SilentlyContinue
+            if ($c -match "https://login.tailscale.com/[a-zA-Z0-9/]+") {
+              $auth = $matches[0]
+              Write-Host "Auth URL found in stdout: $auth"
+              Save "WAITING_AUTH|$auth"
+              break
+            }
+          }
+          
+          # Check stderr log
+          if (Test-Path "ts_err.log") {
+            $c = Get-Content "ts_err.log" -Raw -ErrorAction SilentlyContinue
+            if ($c -match "https://login.tailscale.com/[a-zA-Z0-9/]+") {
+              $auth = $matches[0]
+              Write-Host "Auth URL found in stderr: $auth"
+              Save "WAITING_AUTH|$auth"
+              break
+            }
+          }
+          
+          # Check if already connected
+          try {
+            $ip = & $exe ip -4 2>$null
+            if ($ip -match "^100.") {
+              Write-Host "Connected: $ip"
+              Save "$($ip.Trim()):3389|$pw"
+              break
+            }
+          } catch {}
+          
+          Start-Sleep 3
+        }
+        
+        # Wait for login (10 min)
+        $ip = ""
+        $loginStart = Get-Date
+        while ((Get-Date) - $loginStart -lt [TimeSpan]::FromMinutes(10)) {
+          try {
+            $ip = & $exe ip -4 2>$null
+            if ($ip -match "^100.") {
+              Write-Host "Login OK: $ip"
+              Save "$($ip.Trim()):3389|$pw"
+              break
+            }
+          } catch {}
+          Start-Sleep 5
+        }
+        
+        if (-not $ip) {
+          Write-Host "Login timeout"
+          Save "TIMEOUT|Login timeout, try manual"
+        }
+        
+        # Keep alive
+        for ($m = 1; $m -le $total; $m++) {
+          # Check for late login
+          if (-not $ip) {
+            try {
+              $ip = & $exe ip -4 2>$null
+              if ($ip -match "^100.") {
+                Write-Host "Late login: $ip"
+                Save "$($ip.Trim()):3389|$pw"
+              }
+            } catch {}
+          }
+          Write-Host "Minute $m/$total"
+          Start-Sleep 60
+        }
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: result
+        path: info.txt
+        retention-days: 1
+        overwrite: true
